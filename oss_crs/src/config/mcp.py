@@ -5,11 +5,22 @@ This module provides the schema for MCP server definitions (stored in
 ``registry/mcp/<name>.yaml``) and the registry that loads and validates them.
 """
 
+import subprocess
+import hashlib
 from pathlib import Path
 from typing import Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+
+def _is_dockerfile_path(image: str) -> bool:
+    """Distinguish explicit filesystem paths from Docker image references."""
+    return (
+        image.startswith(("/", "./", "../", "~/"))
+        or Path(image).name.startswith("Dockerfile")
+        or Path(image).suffix == ".dockerfile"
+    )
 
 
 class MCPServerConfig(BaseModel):
@@ -23,6 +34,26 @@ class MCPServerConfig(BaseModel):
     url: str
     requires_source: bool = False
     command: Optional[list[str]] = None
+
+    @property
+    def dockerfile_path(self) -> Optional[Path]:
+        if not _is_dockerfile_path(self.image):
+            return None
+        path = Path(self.image).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(
+                f"MCP server '{self.name}' Dockerfile does not exist or is not a file: {path}"
+            )
+        return path
+
+    @property
+    def resolved_image(self) -> str:
+        """Image reference shared by preparation and Compose rendering."""
+        dockerfile = self.dockerfile_path
+        if dockerfile is None:
+            return self.image
+        digest = hashlib.sha256(str(dockerfile).encode()).hexdigest()[:12]
+        return f"oss-crs-mcp/{self.name.lower()}:{digest}"
 
     @field_validator("name")
     @classmethod
@@ -73,6 +104,11 @@ class MCPRegistry:
                 continue
 
             server = MCPServerConfig(**data)
+            if _is_dockerfile_path(server.image):
+                path = Path(server.image).expanduser()
+                if not path.is_absolute():
+                    path = yaml_file.parent / path
+                server.image = str(path.resolve())
             if server.name in self._servers:
                 raise ValueError(
                     f"Duplicate MCP server name '{server.name}' "
@@ -141,3 +177,136 @@ def load_mcp_servers(
         servers.append(server)
 
     return servers
+
+
+def mcp_source_dir_for_image(image: str, infra_root: Path) -> Optional[Path]:
+    """Locate the local build source for an MCP server image, if any.
+
+    By convention an in-repo server image ``<prefix>/<dirname>[:tag]`` is
+    built from ``oss-crs-infra/mcp/<dirname>/Dockerfile``. The directory is
+    derived from the image reference (not the registry name, which may use
+    different separators, e.g. ``ast_grep`` vs ``ast-grep``).
+
+    Args:
+        image: Docker image reference from the registry entry.
+        infra_root: Path to ``oss-crs-infra``.
+
+    Returns:
+        The source directory if it contains a Dockerfile, else None (the
+        image is remote-only and must be pulled).
+    """
+    ref = image.strip()
+    # Strip :tag (only when it follows the last /, so registry ports survive).
+    name = ref.rsplit("/", 1)[-1]
+    if ":" in name:
+        name = name.rsplit(":", 1)[0]
+    if not name:
+        return None
+    candidate = infra_root / "mcp" / name
+    if (candidate / "Dockerfile").is_file():
+        return candidate
+    return None
+
+
+def ensure_mcp_server_image(
+    server: MCPServerConfig,
+    infra_root: Path,
+    no_pull: bool = False,
+) -> Optional[str]:
+    """Make one MCP server image available locally.
+
+    Servers with a local source are (re)built every time: Docker layer
+    caching makes no-change rebuilds seconds-cheap while source changes
+    rebuild correctly, so a stale ``latest`` tag can never linger the way
+    skip-if-exists schemes allow. Remote-only images are pulled when missing.
+
+    Args:
+        server: Resolved registry entry.
+        infra_root: Path to ``oss-crs-infra``.
+        no_pull: Skip pulls (offline mode); missing remote images are an
+            error instead.
+
+    Returns:
+        None on success, else an error message naming the server.
+    """
+    dockerfile = server.dockerfile_path
+    source_dir = (
+        dockerfile.parent
+        if dockerfile is not None
+        else mcp_source_dir_for_image(server.image, infra_root)
+    )
+    if source_dir is not None:
+        command = ["docker", "build"]
+        if dockerfile is not None:
+            command.extend(["-f", str(dockerfile)])
+        command.extend(["-t", server.resolved_image, str(source_dir)])
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return (
+                f"Failed to build MCP server image '{server.image}' "
+                f"for server '{server.name}' from {source_dir}:\n"
+                f"{result.stderr}"
+            )
+        return None
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", server.image],
+        capture_output=True,
+    )
+    if inspect.returncode == 0:
+        return None
+    if no_pull:
+        return (
+            f"MCP server image '{server.image}' for server '{server.name}' "
+            f"is not present locally and pulls are disabled (--no-pull)"
+        )
+    pull = subprocess.run(
+        ["docker", "pull", server.image],
+        capture_output=True,
+        text=True,
+    )
+    if pull.returncode != 0:
+        return (
+            f"Failed to pull MCP server image '{server.image}' "
+            f"for server '{server.name}':\n{pull.stderr}"
+        )
+    return None
+
+
+def prepare_mcp_server_images(
+    mcp_server_names: Optional[list[str]],
+    registry_dir: Optional[Path] = None,
+    infra_root: Optional[Path] = None,
+    no_pull: bool = False,
+) -> Optional[str]:
+    """Build or pull every MCP server image a compose references.
+
+    Scoped to the referenced servers only (never the whole registry) so
+    prepare pays for what the run will use.
+
+    Args:
+        mcp_server_names: Compose ``mcp_servers`` names (None/empty = no-op).
+        registry_dir: Registry directory (defaults to ``registry/mcp``).
+        infra_root: ``oss-crs-infra`` root (derived from the registry dir
+            by default).
+        no_pull: Skip pulls for remote-only images.
+
+    Returns:
+        None on success, else an error message. Unknown server names raise
+        ValueError (same as :func:`load_mcp_servers`).
+    """
+    servers = load_mcp_servers(mcp_server_names, registry_dir)
+    if not servers:
+        return None
+    if registry_dir is None:
+        registry_dir = get_default_registry_dir()
+    if infra_root is None:
+        infra_root = registry_dir.parent.parent / "oss-crs-infra"
+    for server in servers:
+        error = ensure_mcp_server_image(server, infra_root, no_pull=no_pull)
+        if error is not None:
+            return error
+    return None

@@ -153,7 +153,7 @@ services:
         condition: service_healthy
     environment:
       - LITELLM_API_URL={{ litellm_internal_url }}
-      - LITELLM_SPEND_REPORT_PATH=/litellm-spend-report.json
+      - LITELLM_SPEND_REPORT_PATH=/spend/litellm-spend-report.json
       - LITELLM_SPEND_POLL_INTERVAL_SEC=5
     secrets:
       - litellm_master_key
@@ -167,7 +167,7 @@ services:
       {{ crs_compose_name }}-network:
     volumes:
       - {{ llm_context.key_gen_request_path }}:/key_gen_request.yaml:ro
-      - {{ litellm_spend_report_path }}:/litellm-spend-report.json:rw
+      - {{ litellm_spend_report_dir }}:/spend:rw
   ###########################################
 {% endif %}
   ###########################################
@@ -273,7 +273,7 @@ services:
       - {{ webui_log_dir }}:/webui_logs:rw
       - {{ work_dir.get_build_output_dir("oss-crs-coverage", target, build_id, sanitizer) }}:/coverage_build:ro
 {%- if llm_context is defined and llm_context.mode == "internal" %}
-      - {{ litellm_spend_report_path }}:/litellm-spend-report.json:ro
+      - {{ litellm_spend_report_dir }}:/spend:ro
 {%- endif %}
     networks:
       {{ crs_compose_name }}-infra-only-network:
@@ -377,7 +377,7 @@ services:
 {%- if mcp_servers is defined and mcp_servers %}
 {%- for mcp_server in mcp_servers %}
   mcp-{{ mcp_server.name }}:
-    image: {{ mcp_server.image }}
+    image: {{ mcp_server.resolved_image }}
     attach: false
     restart: on-failure:3
 {%- if mcp_server.command %}

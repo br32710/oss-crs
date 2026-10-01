@@ -1074,6 +1074,44 @@ def test_mcp_servers_rendered_in_compose(monkeypatch, tmp_path: Path) -> None:
     assert "proj-infra-only-network" in mcp_service.get("networks", {})
 
 
+def test_mcp_dockerfile_renders_prepared_image(monkeypatch, tmp_path: Path) -> None:
+    from oss_crs.src.config.mcp import load_mcp_servers, ensure_mcp_server_image
+
+    _patch_renderer(monkeypatch)
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    dockerfile = tmp_path / "Dockerfile.custom"
+    dockerfile.write_text("FROM scratch\n")
+    (registry / "test.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "test",
+                "image": "../Dockerfile.custom",
+                "url": "http://test/mcp",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "oss_crs.src.templates.renderer.get_default_registry_dir", lambda: registry
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr("oss_crs.src.config.mcp.subprocess.run", run)
+    server = load_mcp_servers(["test"], registry)[0]
+    assert ensure_mcp_server_image(server, tmp_path) is None
+    crs = _make_crs(tmp_path, "crs-a")
+    compose = _make_crs_compose(tmp_path, [crs], mcp_servers=["test"])
+    rendered, _ = _render(compose, _make_target(tmp_path, has_repo=True), tmp_path)
+    service = yaml.safe_load(rendered)["services"]["mcp-crs-a-test"]
+    assert service["image"] == calls[0][calls[0].index("-t") + 1]
+    assert service["image"] == server.resolved_image
+    assert "build" not in service
+
+
 def test_mcp_servers_not_rendered_when_empty(monkeypatch, tmp_path: Path) -> None:
     """No MCP services are rendered when mcp_servers is empty or missing."""
     _patch_renderer(monkeypatch)

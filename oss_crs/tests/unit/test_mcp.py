@@ -9,8 +9,11 @@ import yaml
 from oss_crs.src.config.mcp import (
     MCPRegistry,
     MCPServerConfig,
+    ensure_mcp_server_image,
     get_default_registry_dir,
     load_mcp_servers,
+    mcp_source_dir_for_image,
+    prepare_mcp_server_images,
 )
 
 
@@ -182,6 +185,79 @@ class TestLoadMCPServers:
     def test_load_missing_server_raises(self, tmp_path):
         with pytest.raises(ValueError, match="not found in registry"):
             load_mcp_servers(["missing"], tmp_path)
+
+
+@pytest.mark.parametrize(
+    "filename", ["Dockerfile", "Dockerfile.custom", "custom.recipe"]
+)
+def test_explicit_dockerfile_build_uses_parent_context(tmp_path, monkeypatch, filename):
+    import oss_crs.src.config.mcp as mcp_mod
+    from types import SimpleNamespace
+
+    dockerfile = tmp_path / "source with spaces" / filename
+    dockerfile.parent.mkdir()
+    dockerfile.write_text("FROM scratch\n")
+    server = MCPServerConfig(
+        name="TestServer", image=str(dockerfile), url="http://test/mcp"
+    )
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(mcp_mod.subprocess, "run", run)
+    assert ensure_mcp_server_image(server, tmp_path, no_pull=True) is None
+    assert calls == [
+        [
+            "docker",
+            "build",
+            "-f",
+            str(dockerfile),
+            "-t",
+            server.resolved_image,
+            str(dockerfile.parent),
+        ]
+    ]
+    assert server.resolved_image.startswith("oss-crs-mcp/testserver:")
+    assert server.resolved_image == server.model_copy().resolved_image
+
+
+def test_registry_resolves_relative_dockerfile_from_yaml_directory(tmp_path):
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    dockerfile = tmp_path / "server" / "Dockerfile"
+    dockerfile.parent.mkdir()
+    dockerfile.write_text("FROM scratch\n")
+    (registry / "test.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "test",
+                "image": "../server/Dockerfile",
+                "url": "http://test/mcp",
+            }
+        )
+    )
+    server = MCPRegistry(registry).get("test")
+    assert server.dockerfile_path == dockerfile
+    other = MCPServerConfig(
+        name="test", image=str(tmp_path / "other" / "Dockerfile"), url="http://test/mcp"
+    )
+    with pytest.raises(ValueError, match="Dockerfile.*not.*file"):
+        _ = other.resolved_image
+
+
+def test_missing_dockerfile_fails_without_pulling(tmp_path, monkeypatch):
+    import oss_crs.src.config.mcp as mcp_mod
+
+    server = MCPServerConfig(
+        name="test", image=str(tmp_path / "Dockerfile"), url="http://test/mcp"
+    )
+    monkeypatch.setattr(
+        mcp_mod.subprocess, "run", lambda *a, **k: pytest.fail("must not pull")
+    )
+    with pytest.raises(ValueError, match="Dockerfile.*not.*file"):
+        ensure_mcp_server_image(server, tmp_path)
 
 
 class TestDefaultRegistryDir:
@@ -442,3 +518,199 @@ class TestComposeSchemaWithMcpServers:
         data = self._base_compose_data(tmp_path)
         config = CRSComposeConfig.from_dict(data)
         assert config.mcp_servers is None
+
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stderr=""):
+        self.returncode = returncode
+        self.stderr = stderr
+
+
+def _write_registry(registry_dir: Path, entries: list[dict]) -> None:
+    registry_dir.mkdir(parents=True, exist_ok=True)
+    for i, entry in enumerate(entries):
+        (registry_dir / f"srv{i}.yaml").write_text(yaml.dump(entry))
+
+
+def _write_source(infra_root: Path, dirname: str) -> Path:
+    d = infra_root / "mcp" / dirname
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "Dockerfile").write_text("FROM scratch\n")
+    return d
+
+
+class TestMcpSourceDirForImage:
+    def test_local_source_found(self, tmp_path):
+        infra = tmp_path / "oss-crs-infra"
+        _write_source(infra, "ast-grep")
+        assert mcp_source_dir_for_image(
+            "oss-crs-mcp/ast-grep:latest", infra
+        ) == infra / "mcp" / "ast-grep"
+
+    def test_registry_name_not_used(self, tmp_path):
+        # The directory follows the image tag (ast-grep), not the registry
+        # name (ast_grep).
+        infra = tmp_path / "oss-crs-infra"
+        _write_source(infra, "ast-grep")
+        assert (
+            mcp_source_dir_for_image("oss-crs-mcp/ast-grep", infra)
+            == infra / "mcp" / "ast-grep"
+        )
+
+    def test_missing_dockerfile_is_remote(self, tmp_path):
+        infra = tmp_path / "oss-crs-infra"
+        (infra / "mcp" / "foo").mkdir(parents=True)
+        assert mcp_source_dir_for_image("example.com/foo:1.0", infra) is None
+
+    def test_missing_dir_is_remote(self, tmp_path):
+        infra = tmp_path / "oss-crs-infra"
+        infra.mkdir()
+        assert mcp_source_dir_for_image("ghcr.io/org/remote:latest", infra) is None
+
+    def test_registry_port_survives(self, tmp_path):
+        infra = tmp_path / "oss-crs-infra"
+        _write_source(infra, "foo")
+        assert mcp_source_dir_for_image(
+            "localhost:5000/foo", infra
+        ) == infra / "mcp" / "foo"
+
+
+class TestEnsureMcpServerImage:
+    def _server(self, **kwargs):
+        base = {
+            "name": "ast_grep",
+            "image": "oss-crs-mcp/ast-grep:latest",
+            "url": "http://ast_grep:3101/sse",
+        }
+        base.update(kwargs)
+        return MCPServerConfig(**base)
+
+    def test_builds_local_source(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        infra = tmp_path / "oss-crs-infra"
+        src = _write_source(infra, "ast-grep")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _FakeCompleted(0)
+
+        monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
+        assert (
+            ensure_mcp_server_image(self._server(), infra) is None
+        )
+        assert calls == [["docker", "build", "-t",
+                           "oss-crs-mcp/ast-grep:latest", str(src)]]
+
+    def test_build_failure_names_server(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        infra = tmp_path / "oss-crs-infra"
+        _write_source(infra, "ast-grep")
+        monkeypatch.setattr(
+            mcp_mod.subprocess,
+            "run",
+            lambda cmd, **kwargs: _FakeCompleted(1, "boom"),
+        )
+        error = ensure_mcp_server_image(self._server(), infra)
+        assert error is not None
+        assert "ast_grep" in error and "boom" in error
+
+    def test_remote_present_skips_pull(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        infra = tmp_path / "oss-crs-infra"
+        infra.mkdir()
+        calls = []
+        monkeypatch.setattr(
+            mcp_mod.subprocess,
+            "run",
+            lambda cmd, **kwargs: calls.append(cmd) or _FakeCompleted(0),
+        )
+        server = self._server(image="ghcr.io/org/remote:1.0")
+        assert ensure_mcp_server_image(server, infra) is None
+        assert calls == [["docker", "image", "inspect",
+                           "ghcr.io/org/remote:1.0"]]
+
+    def test_remote_missing_pulls(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        infra = tmp_path / "oss-crs-infra"
+        infra.mkdir()
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[1] == "image":
+                return _FakeCompleted(1)
+            return _FakeCompleted(0)
+
+        monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
+        server = self._server(image="ghcr.io/org/remote:1.0")
+        assert ensure_mcp_server_image(server, infra) is None
+        assert ["docker", "pull", "ghcr.io/org/remote:1.0"] in calls
+
+    def test_remote_missing_no_pull_errors(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        infra = tmp_path / "oss-crs-infra"
+        infra.mkdir()
+        monkeypatch.setattr(
+            mcp_mod.subprocess,
+            "run",
+            lambda cmd, **kwargs: _FakeCompleted(1),
+        )
+        server = self._server(image="ghcr.io/org/remote:1.0")
+        error = ensure_mcp_server_image(server, infra, no_pull=True)
+        assert error is not None and "--no-pull" in error
+
+
+class TestPrepareMcpServerImages:
+    def test_empty_is_noop(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        def fail_on_call(*args, **kwargs):
+            raise AssertionError("no docker calls expected")
+
+        monkeypatch.setattr(mcp_mod.subprocess, "run", fail_on_call)
+        assert prepare_mcp_server_images([]) is None
+        assert prepare_mcp_server_images(None) is None
+
+    def test_unknown_server_raises(self, tmp_path):
+        registry = tmp_path / "registry" / "mcp"
+        registry.mkdir(parents=True)
+        with pytest.raises(ValueError, match="not found in registry"):
+            prepare_mcp_server_images(["nope"], registry_dir=registry)
+
+    def test_referenced_only(self, tmp_path, monkeypatch):
+        import oss_crs.src.config.mcp as mcp_mod
+
+        registry = tmp_path / "registry" / "mcp"
+        infra = tmp_path / "oss-crs-infra"
+        _write_registry(
+            registry,
+            [
+                {"name": "a", "image": "oss-crs-mcp/a:latest",
+                 "url": "http://a:1/sse"},
+                {"name": "b", "image": "ghcr.io/org/b:1.0",
+                 "url": "http://b:1/sse"},
+            ],
+        )
+        _write_source(infra, "a")
+        built = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["docker", "build"]:
+                built.append(cmd[3])
+            return _FakeCompleted(0)
+
+        monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
+        assert (
+            prepare_mcp_server_images(
+                ["a"], registry_dir=registry, infra_root=infra
+            )
+            is None
+        )
+        # Only the referenced server was built; b was never touched.
+        assert built == ["oss-crs-mcp/a:latest"]
