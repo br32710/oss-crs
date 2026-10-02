@@ -153,7 +153,7 @@ services:
         condition: service_healthy
     environment:
       - LITELLM_API_URL={{ litellm_internal_url }}
-      - LITELLM_SPEND_REPORT_PATH=/spend/litellm-spend-report.json
+      - LITELLM_SPEND_REPORT_PATH=/litellm-spend-report.json
       - LITELLM_SPEND_POLL_INTERVAL_SEC=5
     secrets:
       - litellm_master_key
@@ -167,7 +167,7 @@ services:
       {{ crs_compose_name }}-network:
     volumes:
       - {{ llm_context.key_gen_request_path }}:/key_gen_request.yaml:ro
-      - {{ litellm_spend_report_dir }}:/spend:rw
+      - {{ litellm_spend_report_path }}:/litellm-spend-report.json:rw
   ###########################################
 {% endif %}
   ###########################################
@@ -273,7 +273,7 @@ services:
       - {{ webui_log_dir }}:/webui_logs:rw
       - {{ work_dir.get_build_output_dir("oss-crs-coverage", target, build_id, sanitizer) }}:/coverage_build:ro
 {%- if llm_context is defined and llm_context.mode == "internal" %}
-      - {{ litellm_spend_report_dir }}:/spend:ro
+      - {{ litellm_spend_report_path }}:/litellm-spend-report.json:ro
 {%- endif %}
     networks:
       {{ crs_compose_name }}-infra-only-network:
@@ -372,25 +372,30 @@ services:
 {%- endfor %}
 {%- endif %}
   ###########################################
-  # MCP SERVERS
+  # MCP SERVERS (per-CRS instances)
   ###########################################
-{%- if mcp_servers is defined and mcp_servers %}
-{%- for mcp_server in mcp_servers %}
-  mcp-{{ mcp_server.name }}:
-    image: {{ mcp_server.resolved_image }}
+{%- if mcp_instances is defined and mcp_instances %}
+{%- for item in mcp_instances %}
+  mcp-{{ item.crs_name }}-{{ item.server.name }}:
+    image: {{ item.image }}
     attach: false
     restart: on-failure:3
-{%- if mcp_server.command %}
-    command: {{ mcp_server.command | tojson }}
+{%- if item.server.command %}
+    command: {{ item.server.command | tojson }}
 {%- endif %}
-{%- if mcp_server.requires_source %}
+{%- if item.server.requires_source or item.server.artifacts_path %}
     volumes:
+{%- if item.server.requires_source %}
       - {{ target_source_path }}:/OSS_CRS_TARGET_SOURCE:ro
+{%- endif %}
+{%- if item.server.artifacts_path %}
+      - {{ item.build_output_dir }}:{{ item.server.artifacts_path }}:ro
+{%- endif %}
 {%- endif %}
     networks:
       {{ crs_compose_name }}-infra-only-network:
         aliases:
-          - {{ mcp_server.name }}
+          - {{ item.gateway_name }}
 {%- endfor %}
 {%- endif %}
 {%- if llm_context is defined %}

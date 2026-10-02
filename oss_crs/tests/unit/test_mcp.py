@@ -358,6 +358,22 @@ class TestModifyLitellmConfigForMcp:
             MCP_HOOK_CALLBACK,
         ]
 
+    def test_per_crs_tuples_namespaced(self, tmp_path):
+        litellm_file, output_file, fn = self._setup(tmp_path)
+        from oss_crs.src.config.mcp import MCPServerConfig as Cfg
+
+        servers = [
+            Cfg(name="ast_grep", image="img", url="http://ast_grep:3101/sse"),
+        ]
+        fn(litellm_file, [("crs-a", servers[0])], output_file)
+        with open(output_file) as f:
+            config = yaml.safe_load(f)
+        assert "crs_a_ast_grep" in config["mcp_servers"]
+        assert (
+            config["mcp_servers"]["crs_a_ast_grep"]["url"]
+            == "http://crs_a_ast_grep:3101/sse"
+        )
+
 
 class TestMcpPromptHook:
     """Tests for the LiteLLM prompt hook (litellm stubbed out)."""
@@ -481,7 +497,7 @@ class TestMcpPromptHook:
 
 
 class TestComposeSchemaWithMcpServers:
-    """Test that the compose schema handles mcp_servers correctly."""
+    """Test that the compose schema handles per-CRS mcp_servers correctly."""
 
     def _base_compose_data(self, tmp_path):
         litellm_file = tmp_path / "litellm.yaml"
@@ -507,17 +523,110 @@ class TestComposeSchemaWithMcpServers:
         from oss_crs.src.config.crs_compose import CRSComposeConfig
 
         data = self._base_compose_data(tmp_path)
-        data["mcp_servers"] = ["ripgrep", "tree-sitter"]
+        data["crs-claude-code"]["mcp_servers"] = ["ripgrep", "tree_sitter"]
 
         config = CRSComposeConfig.from_dict(data)
-        assert config.mcp_servers == ["ripgrep", "tree-sitter"]
+        assert config.crs_entries["crs-claude-code"].mcp_servers == [
+            "ripgrep",
+            "tree_sitter",
+        ]
 
     def test_compose_without_mcp_servers(self, tmp_path):
         from oss_crs.src.config.crs_compose import CRSComposeConfig
 
         data = self._base_compose_data(tmp_path)
         config = CRSComposeConfig.from_dict(data)
-        assert config.mcp_servers is None
+        assert config.crs_entries["crs-claude-code"].mcp_servers is None
+
+    def test_compose_rejects_root_mcp_servers(self, tmp_path):
+        from oss_crs.src.config.crs_compose import CRSComposeConfig
+
+        data = self._base_compose_data(tmp_path)
+        data["mcp_servers"] = ["ripgrep"]
+        with pytest.raises(ValueError, match="per-CRS"):
+            CRSComposeConfig.from_dict(data)
+
+    @pytest.mark.parametrize("name", ["reach-check", "", "bad.name", "réachcheck"])
+    def test_invalid_server_names_rejected_before_source_resolution(
+        self, tmp_path, monkeypatch, name
+    ):
+        from oss_crs.src.config.crs_compose import CRSComposeConfig
+
+        def unexpected_resolution(*args, **kwargs):
+            pytest.fail("Invalid MCP names must fail before resolving CRS sources")
+
+        monkeypatch.setattr(
+            "oss_crs.src.config.crs_compose.resolve_source_from_registry",
+            unexpected_resolution,
+        )
+        data = self._base_compose_data(tmp_path)
+        data["crs-claude-code"]["mcp_servers"] = [name]
+        with pytest.raises(ValueError, match="Invalid MCP server name"):
+            CRSComposeConfig.from_dict(data)
+
+    def test_normalized_gateway_collision_rejected(self, tmp_path):
+        from oss_crs.src.config.crs_compose import CRSComposeConfig
+
+        data = self._base_compose_data(tmp_path)
+        data["crs-claude-code"]["mcp_servers"] = ["reachcheck"]
+        data["crs_claude_code"] = dict(data["crs-claude-code"])
+        with pytest.raises(ValueError, match="Duplicate MCP gateway name"):
+            CRSComposeConfig.from_dict(data)
+
+
+class TestMCPServerArtifactsPath:
+    def test_valid(self):
+        config = MCPServerConfig(
+            name="test",
+            image="some-image",
+            url="http://test:8000/mcp",
+            artifacts_path="/artifacts",
+        )
+        assert config.artifacts_path == "/artifacts"
+
+    def test_defaults_none(self):
+        config = MCPServerConfig(
+            name="test",
+            image="some-image",
+            url="http://test:8000/mcp",
+        )
+        assert config.artifacts_path is None
+
+    @pytest.mark.parametrize("bad", ["", "relative", "artifacts", "/a:b", "/a/../b"])
+    def test_invalid_rejected(self, bad):
+        with pytest.raises(ValueError):
+            MCPServerConfig(
+                name="test",
+                image="some-image",
+                url="http://test:8000/mcp",
+                artifacts_path=bad,
+            )
+
+
+class TestMCPNamingHelpers:
+    def test_service_and_gateway_names(self):
+        from oss_crs.src.config.mcp import (
+            mcp_gateway_name,
+            mcp_instance_alias,
+            mcp_service_name,
+            remap_mcp_url_for_crs,
+        )
+
+        assert mcp_service_name("crs-a", "ast_grep") == "mcp-crs-a-ast_grep"
+        assert mcp_gateway_name("crs-a", "ast_grep") == "crs_a_ast_grep"
+        assert mcp_instance_alias("crs-a", "ast_grep") == "crs_a_ast_grep"
+        assert (
+            remap_mcp_url_for_crs(
+                "http://ast_grep:3101/sse", "crs-a", "ast_grep"
+            )
+            == "http://crs_a_ast_grep:3101/sse"
+        )
+
+    def test_registry_name_with_hyphen_rejected(self):
+        with pytest.raises(ValueError, match="hyphens are not allowed"):
+            MCPServerConfig(
+                name="reach-check", image="img:latest", url="http://server:3102/mcp"
+            )
 
 
 class _FakeCompleted:
@@ -714,3 +823,36 @@ class TestPrepareMcpServerImages:
         )
         # Only the referenced server was built; b was never touched.
         assert built == ["oss-crs-mcp/a:latest"]
+
+
+def test_prepare_reads_mcp_servers_from_compose_entries(monkeypatch):
+    from types import SimpleNamespace
+
+    from oss_crs.src.config.crs_compose import CRSEntry
+    from oss_crs.src.crs_compose import CRSCompose
+
+    compose = CRSCompose.__new__(CRSCompose)
+    compose.crs_list = [
+        SimpleNamespace(
+            config=SimpleNamespace(),
+            resource=CRSEntry(
+                cpuset="2-7", memory="16G", mcp_servers=["reachcheck", "ast_grep"]
+            ),
+        ),
+        SimpleNamespace(
+            config=SimpleNamespace(),
+            resource=CRSEntry(cpuset="2-7", memory="16G", mcp_servers=["reachcheck"]),
+        ),
+        SimpleNamespace(config=SimpleNamespace(), resource=None),
+    ]
+    calls = []
+
+    def fake_prepare(names, *, no_pull):
+        calls.append((names, no_pull))
+
+    monkeypatch.setattr(
+        "oss_crs.src.crs_compose.prepare_mcp_server_images", fake_prepare
+    )
+    result = compose._CRSCompose__prepare_mcp_servers(no_pull=True)
+    assert result.success
+    assert calls == [(["reachcheck", "ast_grep"], True)]

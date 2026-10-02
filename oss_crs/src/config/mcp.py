@@ -7,11 +7,22 @@ This module provides the schema for MCP server definitions (stored in
 
 import subprocess
 import hashlib
+import re
 from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
+
+
+def validate_mcp_server_name(name: str) -> str:
+    """Validate names before they reach LiteLLM's MCP gateway."""
+    if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+        raise ValueError(
+            f"Invalid MCP server name {name!r}: use only ASCII letters, digits "
+            "and underscores; hyphens are not allowed by LiteLLM"
+        )
+    return name
 
 
 def _is_dockerfile_path(image: str) -> bool:
@@ -34,6 +45,7 @@ class MCPServerConfig(BaseModel):
     url: str
     requires_source: bool = False
     command: Optional[list[str]] = None
+    artifacts_path: Optional[str] = None
 
     @property
     def dockerfile_path(self) -> Optional[Path]:
@@ -58,12 +70,7 @@ class MCPServerConfig(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        if not v or not v.replace("-", "").replace("_", "").isalnum():
-            raise ValueError(
-                "MCP server name must be a non-empty alphanumeric string "
-                "with optional hyphens/underscores"
-            )
-        return v
+        return validate_mcp_server_name(v)
 
     @field_validator("image")
     @classmethod
@@ -78,6 +85,65 @@ class MCPServerConfig(BaseModel):
         if not v.startswith(("http://", "https://")):
             raise ValueError("MCP server URL must start with http:// or https://")
         return v
+
+    @field_validator("artifacts_path")
+    @classmethod
+    def validate_artifacts_path(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not v or not v.startswith("/"):
+            raise ValueError(
+                "MCP server artifacts_path must be an absolute container path "
+                f"starting with '/': {v!r}"
+            )
+        if ":" in v:
+            raise ValueError(
+                f"MCP server artifacts_path must not contain ':': {v!r}"
+            )
+        parts = v.split("/")
+        if ".." in parts:
+            raise ValueError(
+                f"MCP server artifacts_path must not contain '..': {v!r}"
+            )
+        return v
+
+
+def mcp_service_name(crs_name: str, server_name: str) -> str:
+    """Compose service name for a per-CRS MCP server instance."""
+    return f"mcp-{crs_name}-{server_name}"
+
+
+def mcp_gateway_name(crs_name: str, server_name: str) -> str:
+    """LiteLLM gateway key for a per-CRS MCP server instance."""
+    validate_mcp_server_name(server_name)
+    return validate_mcp_server_name(f"{crs_name.replace('-', '_')}_{server_name}")
+
+
+def mcp_instance_alias(crs_name: str, server_name: str) -> str:
+    """DNS alias a per-CRS MCP server instance is reachable at."""
+    return mcp_gateway_name(crs_name, server_name)
+
+
+def remap_mcp_url_for_crs(url: str, crs_name: str, server_name: str) -> str:
+    """Rewrite a registry MCP server URL to its per-CRS instance alias.
+
+    Preserves scheme, port, and path; only the hostname is replaced with
+    the namespaced alias so two CRSs using the same registry server do not
+    collide on shared infra-only-network DNS.
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    parsed = urlparse(url)
+    alias = mcp_instance_alias(crs_name, server_name)
+    netloc = alias
+    if parsed.port:
+        netloc = f"{alias}:{parsed.port}"
+    elif parsed.hostname and ":" in parsed.netloc and "@" not in parsed.netloc:
+        # Preserve explicit port edge cases urlparse misses (should be rare).
+        netloc = parsed.netloc.replace(parsed.hostname, alias, 1)
+    return urlunparse(
+        (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+    )
 
 
 class MCPRegistry:

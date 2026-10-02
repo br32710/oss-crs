@@ -976,16 +976,22 @@ class CRSCompose:
         return True
 
     def __prepare_mcp_servers(self, no_pull: bool = False) -> "TaskResult":
-        """Build or pull this compose's MCP server images once, at prepare.
+        """Build or pull this compose's per-CRS MCP server images once.
 
-        Scoped to the referenced servers only. Local-source servers are
-        rebuilt every prepare (Docker layer caching keeps no-change rebuilds
-        cheap) so a stale ``latest`` tag can never linger into a run;
-        remote-only images are pulled when missing.
+        Collects the union of every CRS entry's ``mcp_servers`` (each CRS
+        owns its instances; shared images are built once). Local-source
+        servers are rebuilt every prepare (Docker layer caching keeps
+        no-change rebuilds cheap) so a stale ``latest`` tag can never
+        linger into a run; remote-only images are pulled when missing.
         """
+        names: list[str] = []
+        for crs in self.crs_list:
+            for name in getattr(crs.resource, "mcp_servers", None) or []:
+                if name not in names:
+                    names.append(name)
         try:
             error = prepare_mcp_server_images(
-                getattr(self.config, "mcp_servers", None),
+                names or None,
                 no_pull=no_pull,
             )
         except ValueError as e:

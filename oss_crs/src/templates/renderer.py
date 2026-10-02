@@ -6,7 +6,12 @@ import os
 import yaml
 
 from ..config.crs import CRSType, OSS_CRS_INFRA_PREFIX
-from ..config.mcp import get_default_registry_dir, load_mcp_servers
+from ..config.mcp import (
+    get_default_registry_dir,
+    load_mcp_servers,
+    mcp_gateway_name,
+    remap_mcp_url_for_crs,
+)
 from ..constants import (
     EXCHANGE_DIR_NAMES,
     LITELLM_INTERNAL_URL,
@@ -277,7 +282,11 @@ def modify_litellm_config_for_mcp(
 
     Args:
         litellm_config_path: Path to the original LiteLLM config.
-        mcp_server_configs: List of MCPServerConfig objects to add.
+        mcp_server_configs: List of MCPServerConfig objects to add, or
+            (crs_name, MCPServerConfig) tuples for per-CRS instances. Tuples
+            are namespaced as ``<crs>_<server>`` with the registry URL host
+            remapped to the per-CRS alias so instances sharing
+            infra-only-network DNS do not collide.
         output_path: Path where the modified config will be written.
 
     Returns:
@@ -297,10 +306,20 @@ def modify_litellm_config_for_mcp(
     # Add mcp_servers section. Transport defaults to SSE in LiteLLM, but our
     # registry servers speak streamable HTTP; allow_all_keys lets this run's
     # per-CRS virtual keys reach the gateway without per-key grants.
+    # Per-CRS tuples are namespaced to avoid collisions when two CRSs share
+    # a registry server with different build artifacts.
     mcp_servers = {}
-    for mcp_server in mcp_server_configs:
-        mcp_servers[mcp_server.name] = {
-            "url": mcp_server.url,
+    for entry in mcp_server_configs:
+        if isinstance(entry, tuple):
+            crs_name, mcp_server = entry
+            key = mcp_gateway_name(crs_name, mcp_server.name)
+            url = remap_mcp_url_for_crs(mcp_server.url, crs_name, mcp_server.name)
+        else:
+            mcp_server = entry
+            key = mcp_server.name
+            url = mcp_server.url
+        mcp_servers[key] = {
+            "url": url,
             "transport": "http",
             "allow_all_keys": True,
         }
@@ -560,14 +579,47 @@ def render_run_crs_compose_docker_compose(
             warnings.extend(env_plan.warnings)
     context["module_envs"] = module_envs
 
-    # Load MCP server configurations (if any)
-    mcp_server_names = getattr(crs_compose.config, "mcp_servers", None) or []
-    if mcp_server_names:
-        mcp_servers = load_mcp_servers(
-            mcp_server_names,
-            get_default_registry_dir(),
-        )
-        context["mcp_servers"] = mcp_servers
+    # Load per-CRS MCP server configurations (if any). Each CRS owns its
+    # instances: service mcp-<crs>-<name>, gateway <crs>_<name>.
+    mcp_instances: list[dict] = []
+    gateway_entries: list[tuple] = []
+    for crs in crs_compose.crs_list:
+        crs_mcp_names = getattr(crs.resource, "mcp_servers", None) or []
+        if not crs_mcp_names:
+            continue
+        try:
+            servers = load_mcp_servers(
+                crs_mcp_names,
+                get_default_registry_dir(),
+            )
+        except ValueError as e:
+            raise ValueError(f"CRS '{crs.name}': {e}") from e
+        for server in servers:
+            build_out = crs_compose.work_dir.get_build_output_dir(
+                crs.name, target, build_id, sanitizer, create=False
+            )
+            if server.artifacts_path:
+                if source_only or not Path(build_out).is_dir():
+                    raise ValueError(
+                        f"CRS '{crs.name}' MCP server '{server.name}': "
+                        f"artifacts_path '{server.artifacts_path}' requires "
+                        f"build output at {build_out}, which is not present "
+                        f"(source_only={source_only})."
+                    )
+            mcp_instances.append(
+                {
+                    "crs_name": crs.name,
+                    "gateway_name": mcp_gateway_name(crs.name, server.name),
+                    "server": server,
+                    "image": server.resolved_image,
+                    "build_output_dir": str(build_out),
+                }
+            )
+            gateway_entries.append((crs.name, server))
+    if mcp_instances:
+        context["mcp_instances"] = mcp_instances
+        # Backward-compat alias for older templates/tests (flat server list).
+        context["mcp_servers"] = [item["server"] for item in mcp_instances]
 
         # Modify LiteLLM config to include MCP server connections
         if llm_context is not None and llm_context.get("litellm_config_path"):
@@ -579,7 +631,7 @@ def render_run_crs_compose_docker_compose(
             modified_config_path = tmp_docker_compose.dir / "litellm-config-mcp.yaml"
             _, hook_path = modify_litellm_config_for_mcp(
                 original_config_path,
-                mcp_servers,
+                gateway_entries,
                 modified_config_path,
             )
             llm_context["litellm_config_path"] = str(modified_config_path)
