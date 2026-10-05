@@ -335,7 +335,7 @@ class TestMountInfrastructure:
             "postgres_port": 5432,
             "postgres_host": "postgres.oss-crs-infra-only",
             "litellm_internal_url": "http://litellm.oss-crs:4000",
-            "litellm_spend_report_dir": "/host/runs/run-123",
+            "litellm_spend_report_dir": "/host/runs/run-123/spend",
             "sidecar_env": {},
             "web_ui": True,
             "webui_url": "http://webui.example.com",
@@ -347,8 +347,8 @@ class TestMountInfrastructure:
         rendered = template.render(context)
 
         assert "LITELLM_SPEND_REPORT_PATH=/spend/litellm-spend-report.json" in rendered
-        assert "/host/runs/run-123:/spend:rw" in rendered
-        assert "/host/runs/run-123:/spend:ro" in rendered
+        assert "/host/runs/run-123/spend:/spend:rw" in rendered
+        assert "/host/runs/run-123/spend:/spend:ro" in rendered
         assert ":/litellm-spend-report.json:" not in rendered
 
     def test_target_source_mount_always_present(self, jinja_env):

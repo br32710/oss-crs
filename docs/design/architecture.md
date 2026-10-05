@@ -214,7 +214,7 @@ LiteLLM integration modes:
 
 #### Spend and token reporting
 
-`litellm-key-gen` polls LiteLLM every few seconds and writes a host-recoverable `litellm-spend-report.json` per run (`<run_dir>/litellm-spend-report.json`):
+`litellm-key-gen` polls LiteLLM every few seconds and writes a host-recoverable `litellm-spend-report.json` per run (`<run_dir>/spend/litellm-spend-report.json`):
 
 ```json
 {"totals": {"credits_used": 0.0, "prompt_tokens": 251234,

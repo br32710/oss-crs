@@ -188,7 +188,14 @@ class _FakeWorkDir:
         self, run_id: str, sanitizer: str, *, create_parent: bool = False
     ):
         _ = create_parent
-        return self._tmp / sanitizer / "runs" / run_id / "litellm-spend-report.json"
+        return (
+            self._tmp
+            / sanitizer
+            / "runs"
+            / run_id
+            / "spend"
+            / "litellm-spend-report.json"
+        )
 
     def get_submit_artifact_counts(self, crs_name, target, run_id, sanitizer):
         return {}
@@ -547,7 +554,9 @@ def _make_meta_compose(tmp_path, run_id: str):
 def test_collect_run_meta_carries_token_counts(tmp_path) -> None:
     run_id = "token-run-id"
     sanitizer = "address"
-    report = tmp_path / sanitizer / "runs" / run_id / "litellm-spend-report.json"
+    report = (
+        tmp_path / sanitizer / "runs" / run_id / "spend" / "litellm-spend-report.json"
+    )
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
         json.dumps(
@@ -591,7 +600,9 @@ def test_collect_run_meta_carries_token_counts(tmp_path) -> None:
 def test_collect_run_meta_sums_tokens_when_totals_missing(tmp_path) -> None:
     run_id = "token-sum-run-id"
     sanitizer = "address"
-    report = tmp_path / sanitizer / "runs" / run_id / "litellm-spend-report.json"
+    report = (
+        tmp_path / sanitizer / "runs" / run_id / "spend" / "litellm-spend-report.json"
+    )
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(
         json.dumps(
