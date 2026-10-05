@@ -6,7 +6,6 @@ the master-key secret stubbed (only during import). HTTP is mocked; date
 handling is asserted against the real clock.
 """
 
-import hashlib
 import importlib.util
 import json
 from datetime import date, timedelta
@@ -105,18 +104,19 @@ def test_collect_matches_spend_logs_end_to_end(
     keygen: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Full loop against the live v1.94.0 shapes: /key/info spend plus
-    /spend/logs rows filtered by key hash, written to the report file."""
+    /spend/logs rows already filtered server-side via ?api_key=."""
     raw = "sk-live-key"
-    key_hash = hashlib.sha256(raw.encode()).hexdigest()
     rows = [
-        {"api_key": key_hash, "prompt_tokens": 30055, "completion_tokens": 2650},
-        {"api_key": key_hash, "prompt_tokens": 21693, "completion_tokens": 19},
-        {"api_key": "other", "prompt_tokens": 99999, "completion_tokens": 99999},
+        {"api_key": raw, "prompt_tokens": 30055, "completion_tokens": 2650},
+        {"api_key": raw, "prompt_tokens": 21693, "completion_tokens": 19},
     ]
 
     def fake_get(url: str, **kwargs: object) -> mock.MagicMock:
         if url.endswith("/key/info"):
             return _spend_response(2.0)
+        params = kwargs.get("params")
+        assert isinstance(params, dict)
+        assert params.get("api_key") == raw
         return _logs_response(rows)
 
     report = tmp_path / "spend.json"

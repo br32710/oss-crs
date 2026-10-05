@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-import hashlib
 import json
 import os
 import signal
@@ -130,12 +129,9 @@ def get_key_tokens(
 ) -> tuple[int, int]:
     """Fetch cumulative (prompt, completion) tokens for a key.
 
-    Sums ``prompt_tokens``/``completion_tokens`` over this key's rows in
-    LiteLLM's spend logs (provider ``usage`` verbatim), independent of the
-    price map — so models missing from the cost map still report tokens
-    while ``spend`` stays 0. Rows are matched by key hash, the form
-    LiteLLM stores in ``api_key``. Fail-open: any error yields (0, 0) so
-    dollar polling never breaks.
+    Sums ``prompt_tokens``/``completion_tokens`` in
+    LiteLLM's spend logs per CRS, filtered by the api_key.
+    Any error yields (0, 0).
     """
     if not api_key:
         return (0, 0)
@@ -145,19 +141,22 @@ def get_key_tokens(
     start = start_date or _today_str()
     end = end_date or _end_date_str()
     try:
-        key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+        params: dict[str, str] = {
+            "start_date": start,
+            "end_date": end,
+            "summarize": "false",
+            "api_key": api_key,
+        }
         response = requests.get(
             f"{LITELLM_API_URL}/spend/logs",
             headers=headers,
-            params={"start_date": start, "end_date": end, "summarize": "false"},
+            params=params,
             timeout=30,
         )
         response.raise_for_status()
         prompt = 0
         completion = 0
         for row in response.json():
-            if row.get("api_key") not in (api_key, key_hash):
-                continue
             prompt += int(row.get("prompt_tokens", 0) or 0)
             completion += int(row.get("completion_tokens", 0) or 0)
         return prompt, completion
