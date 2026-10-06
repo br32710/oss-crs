@@ -32,7 +32,9 @@ def _patch_renderer(monkeypatch, build_env_fn=None, llm_context_fn=None):
     )
 
 
-def _make_crs_compose(tmp_path: Path, crs_list: list, mcp_servers: list | None = None) -> SimpleNamespace:
+def _make_crs_compose(
+    tmp_path: Path, crs_list: list, mcp_servers: list | None = None
+) -> SimpleNamespace:
     # Per-CRS model: compose-level mcp_servers arg is distributed to each CRS.
     for crs in crs_list:
         crs.resource.mcp_servers = mcp_servers
@@ -1185,9 +1187,7 @@ def test_mcp_command_rendered(monkeypatch, tmp_path: Path) -> None:
 
 def test_mcp_hook_mounted_for_internal_llm(monkeypatch, tmp_path: Path) -> None:
     """With MCP servers + internal LiteLLM, the prompt hook is mounted."""
-    _patch_renderer(
-        monkeypatch, llm_context_fn=_internal_llm_context(tmp_path)
-    )
+    _patch_renderer(monkeypatch, llm_context_fn=_internal_llm_context(tmp_path))
 
     # The internal context points at a config file; it must exist for the
     # MCP config rewrite to read it.
@@ -1318,7 +1318,9 @@ def test_mcp_artifacts_path_missing_fails(monkeypatch, tmp_path: Path) -> None:
     crs = _make_crs(tmp_path, "crs-a")
     crs_compose = _make_crs_compose(tmp_path, [crs], mcp_servers=["an"])
     # Point build output at a missing dir.
-    crs_compose.work_dir.get_build_output_dir = lambda *_a, **_k: tmp_path / "missing-build"
+    crs_compose.work_dir.get_build_output_dir = lambda *_a, **_k: (
+        tmp_path / "missing-build"
+    )
     target = _make_target(tmp_path, has_repo=True)
     with pytest.raises(ValueError, match="artifacts_path"):
         _render(crs_compose, target, tmp_path)

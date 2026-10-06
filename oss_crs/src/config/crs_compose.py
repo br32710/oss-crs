@@ -190,6 +190,22 @@ class CRSComposeConfig(BaseModel):
     llm_config: Optional[LLMConfig] = None
 
     @model_validator(mode="after")
+    def validate_mcp_servers_require_internal_llm(self):
+        users = sorted(
+            name for name, entry in self.crs_entries.items() if entry.mcp_servers
+        )
+        if users:
+            if (
+                self.llm_config is None
+                or self.llm_config.litellm.mode != self.llm_config.litellm.Mode.INTERNAL
+            ):
+                raise ValueError(
+                    f"'mcp_servers' requires 'llm_config.litellm.mode: internal' "
+                    f"(set by: {', '.join(users)})"
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_mcp_gateway_names(self):
         owners: dict[str, str] = {}
         for crs_name, entry in self.crs_entries.items():

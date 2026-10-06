@@ -6,13 +6,22 @@ This module provides the schema for MCP server definitions (stored in
 """
 
 import subprocess
-import hashlib
 import re
+import hashlib
 from pathlib import Path
 from typing import Optional
 
 import yaml
 from pydantic import BaseModel, field_validator
+
+
+def _is_dockerfile_path(image: str) -> bool:
+    """Distinguish explicit filesystem paths from Docker image references."""
+    return (
+        image.startswith(("/", "./", "../", "~/"))
+        or Path(image).name.startswith("Dockerfile")
+        or Path(image).suffix == ".dockerfile"
+    )
 
 
 def validate_mcp_server_name(name: str) -> str:
@@ -25,15 +34,6 @@ def validate_mcp_server_name(name: str) -> str:
     return name
 
 
-def _is_dockerfile_path(image: str) -> bool:
-    """Distinguish explicit filesystem paths from Docker image references."""
-    return (
-        image.startswith(("/", "./", "../", "~/"))
-        or Path(image).name.startswith("Dockerfile")
-        or Path(image).suffix == ".dockerfile"
-    )
-
-
 class MCPServerConfig(BaseModel):
     """Configuration for a single MCP server.
 
@@ -43,6 +43,7 @@ class MCPServerConfig(BaseModel):
     name: str
     image: str
     url: str
+    transport: str = "http"
     requires_source: bool = False
     command: Optional[list[str]] = None
     artifacts_path: Optional[str] = None
@@ -86,6 +87,16 @@ class MCPServerConfig(BaseModel):
             raise ValueError("MCP server URL must start with http:// or https://")
         return v
 
+    @field_validator("transport")
+    @classmethod
+    def validate_transport(cls, v: str) -> str:
+        if v not in ("http", "sse", "streamable-http"):
+            raise ValueError(
+                "MCP server transport must be one of 'http', 'sse', "
+                f"or 'streamable-http', got: {v!r}"
+            )
+        return "http" if v == "streamable-http" else v
+
     @field_validator("artifacts_path")
     @classmethod
     def validate_artifacts_path(cls, v: Optional[str]) -> Optional[str]:
@@ -97,14 +108,10 @@ class MCPServerConfig(BaseModel):
                 f"starting with '/': {v!r}"
             )
         if ":" in v:
-            raise ValueError(
-                f"MCP server artifacts_path must not contain ':': {v!r}"
-            )
+            raise ValueError(f"MCP server artifacts_path must not contain ':': {v!r}")
         parts = v.split("/")
         if ".." in parts:
-            raise ValueError(
-                f"MCP server artifacts_path must not contain '..': {v!r}"
-            )
+            raise ValueError(f"MCP server artifacts_path must not contain '..': {v!r}")
         return v
 
 
@@ -142,7 +149,14 @@ def remap_mcp_url_for_crs(url: str, crs_name: str, server_name: str) -> str:
         # Preserve explicit port edge cases urlparse misses (should be rare).
         netloc = parsed.netloc.replace(parsed.hostname, alias, 1)
     return urlunparse(
-        (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+        (
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
     )
 
 
@@ -177,8 +191,7 @@ class MCPRegistry:
                 server.image = str(path.resolve())
             if server.name in self._servers:
                 raise ValueError(
-                    f"Duplicate MCP server name '{server.name}' "
-                    f"found in {yaml_file}"
+                    f"Duplicate MCP server name '{server.name}' found in {yaml_file}"
                 )
             self._servers[server.name] = server
 

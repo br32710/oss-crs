@@ -36,6 +36,27 @@ class TestMCPServerConfig:
         )
         assert config.requires_source is False
 
+    def test_transport_defaults_http(self):
+        config = MCPServerConfig(name="test", image="img", url="http://test/mcp")
+        assert config.transport == "http"
+
+    @pytest.mark.parametrize(
+        ("transport", "expected"),
+        [("http", "http"), ("sse", "sse"), ("streamable-http", "http")],
+    )
+    def test_transport_validated_and_normalized(self, transport, expected):
+        config = MCPServerConfig(
+            name="test", image="img", url="http://test/mcp", transport=transport
+        )
+        assert config.transport == expected
+
+    @pytest.mark.parametrize("transport", ["", "stdio", "HTTP", None, 42])
+    def test_invalid_transport_rejected(self, transport):
+        with pytest.raises(ValueError, match="transport"):
+            MCPServerConfig(
+                name="test", image="img", url="http://test/mcp", transport=transport
+            )
+
     def test_command_field(self):
         config = MCPServerConfig(
             name="semgrep",
@@ -311,6 +332,21 @@ class TestModifyLitellmConfigForMcp:
         assert hook_path.parent == output_file.parent
         assert "proxy_handler_instance" in Path(hook_path).read_text()
 
+    @pytest.mark.parametrize(
+        ("transport", "expected"),
+        [("http", "http"), ("sse", "sse"), ("streamable-http", "http")],
+    )
+    @pytest.mark.parametrize("namespaced", [False, True])
+    def test_renders_server_transport(self, tmp_path, transport, expected, namespaced):
+        litellm_file, output_file, fn = self._setup(tmp_path)
+        server = MCPServerConfig(
+            name="test", image="img", url="http://test/mcp", transport=transport
+        )
+        fn(litellm_file, [("crs-a", server)] if namespaced else [server], output_file)
+        config = yaml.safe_load(output_file.read_text())
+        key = "crs_a_test" if namespaced else "test"
+        assert config["mcp_servers"][key]["transport"] == expected
+
     def test_preserves_existing_config(self, tmp_path):
         litellm_file, output_file, fn = self._setup(tmp_path)
         mcp_servers = [
@@ -387,9 +423,7 @@ class TestMcpPromptHook:
         if "litellm" not in sys.modules:
             litellm_pkg = types.ModuleType("litellm")
             integrations = types.ModuleType("litellm.integrations")
-            custom_logger = types.ModuleType(
-                "litellm.integrations.custom_logger"
-            )
+            custom_logger = types.ModuleType("litellm.integrations.custom_logger")
 
             class CustomLogger:  # minimal stand-in for isinstance checks
                 pass
@@ -456,33 +490,61 @@ class TestMcpPromptHook:
         out = asyncio.run(inst.async_pre_call_hook(None, None, data, "completion"))
         assert out["system"] == "existing libCRS mcp docs"
 
-    def test_pre_request_hook_appends_system(self):
+    def test_pre_call_hook_anthropic_messages_appends_system(self):
         import asyncio
 
         hook = self._load_hook()
         inst = hook.OssCrsMcpHook()
-        kwargs = {"system": "base instructions"}
+        data = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "base instructions",
+        }
         out = asyncio.run(
-            inst.async_pre_request_hook(
-                "m", [{"role": "user", "content": "hi"}], kwargs
-            )
+            inst.async_pre_call_hook(None, None, data, "anthropic_messages")
         )
         assert "base instructions" in out["system"]
         assert "libCRS mcp" in out["system"]
+        # Anthropic messages must stay untouched (no system role inserted).
+        assert all(m.get("role") != "system" for m in out["messages"])
 
-    def test_pre_request_hook_injects_with_history(self):
+    def test_pre_call_hook_anthropic_messages_injects_when_missing(self):
         import asyncio
 
         hook = self._load_hook()
         inst = hook.OssCrsMcpHook()
-        kwargs = {}
-        messages = [
-            {"role": "user", "content": "a"},
-            {"role": "assistant", "content": "b"},
-            {"role": "user", "content": "c"},
-        ]
-        out = asyncio.run(inst.async_pre_request_hook("m", messages, kwargs))
+        data = {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "b"},
+                {"role": "user", "content": "c"},
+            ],
+        }
+        out = asyncio.run(
+            inst.async_pre_call_hook(None, None, data, "anthropic_messages")
+        )
         assert "libCRS mcp" in out["system"]
+        assert all(m.get("role") != "system" for m in out["messages"])
+
+    def test_pre_call_hook_anthropic_messages_idempotent(self):
+        import asyncio
+
+        hook = self._load_hook()
+        inst = hook.OssCrsMcpHook()
+        data = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "system": "existing libCRS mcp docs",
+        }
+        out = asyncio.run(
+            inst.async_pre_call_hook(None, None, data, "anthropic_messages")
+        )
+        assert out["system"] == "existing libCRS mcp docs"
+
+    def test_no_pre_request_hook_override(self):
+        hook = self._load_hook()
+        assert "async_pre_request_hook" not in hook.OssCrsMcpHook.__dict__
 
     def test_hooks_fail_open(self):
         import asyncio
@@ -490,10 +552,6 @@ class TestMcpPromptHook:
         hook = self._load_hook()
         inst = hook.OssCrsMcpHook()
         assert asyncio.run(inst.async_pre_call_hook(None, None, None, "x")) is None
-        kwargs = {"system": "s"}
-        assert (
-            asyncio.run(inst.async_pre_request_hook("m", None, kwargs)) is kwargs
-        )
 
 
 class TestComposeSchemaWithMcpServers:
@@ -616,9 +674,7 @@ class TestMCPNamingHelpers:
         assert mcp_gateway_name("crs-a", "ast_grep") == "crs_a_ast_grep"
         assert mcp_instance_alias("crs-a", "ast_grep") == "crs_a_ast_grep"
         assert (
-            remap_mcp_url_for_crs(
-                "http://ast_grep:3101/sse", "crs-a", "ast_grep"
-            )
+            remap_mcp_url_for_crs("http://ast_grep:3101/sse", "crs-a", "ast_grep")
             == "http://crs_a_ast_grep:3101/sse"
         )
 
@@ -652,9 +708,10 @@ class TestMcpSourceDirForImage:
     def test_local_source_found(self, tmp_path):
         infra = tmp_path / "oss-crs-infra"
         _write_source(infra, "ast-grep")
-        assert mcp_source_dir_for_image(
-            "oss-crs-mcp/ast-grep:latest", infra
-        ) == infra / "mcp" / "ast-grep"
+        assert (
+            mcp_source_dir_for_image("oss-crs-mcp/ast-grep:latest", infra)
+            == infra / "mcp" / "ast-grep"
+        )
 
     def test_registry_name_not_used(self, tmp_path):
         # The directory follows the image tag (ast-grep), not the registry
@@ -679,9 +736,10 @@ class TestMcpSourceDirForImage:
     def test_registry_port_survives(self, tmp_path):
         infra = tmp_path / "oss-crs-infra"
         _write_source(infra, "foo")
-        assert mcp_source_dir_for_image(
-            "localhost:5000/foo", infra
-        ) == infra / "mcp" / "foo"
+        assert (
+            mcp_source_dir_for_image("localhost:5000/foo", infra)
+            == infra / "mcp" / "foo"
+        )
 
 
 class TestEnsureMcpServerImage:
@@ -706,11 +764,10 @@ class TestEnsureMcpServerImage:
             return _FakeCompleted(0)
 
         monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
-        assert (
-            ensure_mcp_server_image(self._server(), infra) is None
-        )
-        assert calls == [["docker", "build", "-t",
-                           "oss-crs-mcp/ast-grep:latest", str(src)]]
+        assert ensure_mcp_server_image(self._server(), infra) is None
+        assert calls == [
+            ["docker", "build", "-t", "oss-crs-mcp/ast-grep:latest", str(src)]
+        ]
 
     def test_build_failure_names_server(self, tmp_path, monkeypatch):
         import oss_crs.src.config.mcp as mcp_mod
@@ -739,8 +796,7 @@ class TestEnsureMcpServerImage:
         )
         server = self._server(image="ghcr.io/org/remote:1.0")
         assert ensure_mcp_server_image(server, infra) is None
-        assert calls == [["docker", "image", "inspect",
-                           "ghcr.io/org/remote:1.0"]]
+        assert calls == [["docker", "image", "inspect", "ghcr.io/org/remote:1.0"]]
 
     def test_remote_missing_pulls(self, tmp_path, monkeypatch):
         import oss_crs.src.config.mcp as mcp_mod
@@ -800,10 +856,8 @@ class TestPrepareMcpServerImages:
         _write_registry(
             registry,
             [
-                {"name": "a", "image": "oss-crs-mcp/a:latest",
-                 "url": "http://a:1/sse"},
-                {"name": "b", "image": "ghcr.io/org/b:1.0",
-                 "url": "http://b:1/sse"},
+                {"name": "a", "image": "oss-crs-mcp/a:latest", "url": "http://a:1/sse"},
+                {"name": "b", "image": "ghcr.io/org/b:1.0", "url": "http://b:1/sse"},
             ],
         )
         _write_source(infra, "a")
@@ -816,9 +870,7 @@ class TestPrepareMcpServerImages:
 
         monkeypatch.setattr(mcp_mod.subprocess, "run", fake_run)
         assert (
-            prepare_mcp_server_images(
-                ["a"], registry_dir=registry, infra_root=infra
-            )
+            prepare_mcp_server_images(["a"], registry_dir=registry, infra_root=infra)
             is None
         )
         # Only the referenced server was built; b was never touched.

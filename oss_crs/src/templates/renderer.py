@@ -303,8 +303,8 @@ def modify_litellm_config_for_mcp(
     else:
         config.pop("general_settings", None)
 
-    # Add mcp_servers section. Transport defaults to SSE in LiteLLM, but our
-    # registry servers speak streamable HTTP; allow_all_keys lets this run's
+    # Add mcp_servers section with each server's validated transport.
+    # allow_all_keys lets this run's
     # per-CRS virtual keys reach the gateway without per-key grants.
     # Per-CRS tuples are namespaced to avoid collisions when two CRSs share
     # a registry server with different build artifacts.
@@ -320,7 +320,7 @@ def modify_litellm_config_for_mcp(
             url = mcp_server.url
         mcp_servers[key] = {
             "url": url,
-            "transport": "http",
+            "transport": mcp_server.transport,
             "allow_all_keys": True,
         }
     config["mcp_servers"] = mcp_servers

@@ -12,7 +12,8 @@ it with ``importlib``/``exec_module`` from beside ``config.yaml``.
 
 from typing import Any, Dict, List, Optional
 
-from litellm.integrations.custom_logger import CustomLogger
+# LiteLLM is installed in the proxy image, not the host development environment.
+from litellm.integrations.custom_logger import CustomLogger  # pyright: ignore[reportMissingImports]
 
 INSTRUCTION = (
     "[oss-crs] Additional analysis tools are available via the `libCRS mcp` "
@@ -80,7 +81,7 @@ class OssCrsMcpHook(CustomLogger):
         data: Dict[str, Any],
         call_type: Any,
     ) -> Optional[Dict[str, Any]]:
-        """Hook for ``/chat/completions``-family requests."""
+        """Hook for ``/chat/completions``-family and ``/v1/messages`` requests."""
         try:
             if not isinstance(data, dict):
                 return data
@@ -91,7 +92,11 @@ class OssCrsMcpHook(CustomLogger):
                 _completion_system_content(messages)
             ):
                 return data
-            if "system" in data:
+            if call_type == "anthropic_messages" or "system" in data:
+                # Anthropic natively uses top-level ``system``, never a
+                # ``role == "system"`` message, so create/extend
+                # ``data["system"]`` even when the key is missing instead of
+                # falling through to the chat message logic below.
                 data["system"] = _with_instruction(data.get("system"))
                 return data
             for message in messages:
@@ -109,24 +114,6 @@ class OssCrsMcpHook(CustomLogger):
             return data
         except Exception:
             return data
-
-    async def async_pre_request_hook(
-        self, model: str, messages: List[Any], kwargs: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        """Hook for ``/v1/messages``-family (Anthropic passthrough) requests.
-
-        ``messages`` itself is not re-read downstream, so only ``kwargs``
-        (notably ``system``) is modified.
-        """
-        try:
-            if not isinstance(kwargs, dict):
-                return kwargs
-            if _system_has_instruction(kwargs.get("system")):
-                return kwargs
-            kwargs["system"] = _with_instruction(kwargs.get("system"))
-            return kwargs
-        except Exception:
-            return kwargs
 
 
 proxy_handler_instance = OssCrsMcpHook()

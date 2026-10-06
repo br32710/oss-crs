@@ -84,7 +84,8 @@ def _mcp_client_from_env():
         raise MCPGatewayError(
             "MCP gateway is not configured in this environment "
             "(OSS_CRS_LLM_API_URL and OSS_CRS_LLM_API_KEY_FILE / "
-            "OSS_CRS_LLM_API_KEY are missing)"
+            "OSS_CRS_LLM_API_KEY are missing)",
+            exit_code=2,
         )
     return client
 
@@ -94,7 +95,7 @@ def _run_mcp(func, args):
         func(args)
     except MCPGatewayError as e:
         print(f"libCRS mcp: error: {e}", file=sys.stderr)
-        sys.exit(2)
+        sys.exit(getattr(e, "exit_code", 1))
 
 
 def _print_truncated(text: str, max_chars: int) -> None:
@@ -166,14 +167,19 @@ def _mcp_call(args) -> None:
         getattr(args, "server", None),
         timeout=getattr(args, "timeout", None),
     )
+    is_error = isinstance(result, dict) and bool(result.get("isError"))
     if getattr(args, "json", False):
         _print_truncated(
             json.dumps(result, indent=2), getattr(args, "max_output_chars", 0) or 0
         )
+        if is_error:
+            sys.exit(1)
         return
     _print_truncated(
         _extract_result_text(result), getattr(args, "max_output_chars", 20000) or 0
     )
+    if is_error:
+        sys.exit(1)
 
 
 def _extract_result_text(result) -> str:

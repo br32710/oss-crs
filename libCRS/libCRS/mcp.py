@@ -58,22 +58,25 @@ CALL_TIMEOUT = 300
 class MCPGatewayError(RuntimeError):
     """Raised when the MCP gateway is unconfigured or a request fails."""
 
+    def __init__(self, message: str, *, exit_code: int = 1):
+        super().__init__(message)
+        self.exit_code = exit_code
 
-def _read_api_key(
-    key: str | None = None, key_file: str | None = None
-) -> str:
+
+def _read_api_key(key: str | None = None, key_file: str | None = None) -> str:
     """Resolve the per-CRS LiteLLM key, preferring the secret file."""
     if key:
         return key
-    key_file = key_file if key_file is not None else os.environ.get(
-        LLM_API_KEY_FILE_ENV
+    key_file = (
+        key_file if key_file is not None else os.environ.get(LLM_API_KEY_FILE_ENV)
     )
     if key_file:
         try:
             return Path(key_file).read_text().strip()
         except OSError as e:
             raise MCPGatewayError(
-                f"Failed to read MCP gateway key file '{key_file}': {e}"
+                f"Failed to read MCP gateway key file '{key_file}': {e}",
+                exit_code=2,
             ) from e
     return os.environ.get(LLM_API_KEY_ENV, "")
 
@@ -94,9 +97,7 @@ class MCPClient:
         timeout: int = LIST_TIMEOUT,
     ):
         resolved_url = (
-            base_url
-            if base_url is not None
-            else os.environ.get(LLM_API_URL_ENV, "")
+            base_url if base_url is not None else os.environ.get(LLM_API_URL_ENV, "")
         )
         self.base_url = resolved_url.rstrip("/")
         self.api_key = _read_api_key(api_key)
@@ -116,7 +117,8 @@ class MCPClient:
         if not self.api_key:
             raise MCPGatewayError(
                 f"Neither {LLM_API_KEY_FILE_ENV} nor {LLM_API_KEY_ENV} is set; "
-                "MCP gateway is unavailable"
+                "MCP gateway is unavailable",
+                exit_code=2,
             )
         result = {"Authorization": f"Bearer {self.api_key}"}
         if extra:
@@ -126,7 +128,8 @@ class MCPClient:
     def _url(self, path: str) -> str:
         if not self.base_url:
             raise MCPGatewayError(
-                f"{LLM_API_URL_ENV} is not set; MCP gateway is unavailable"
+                f"{LLM_API_URL_ENV} is not set; MCP gateway is unavailable",
+                exit_code=2,
             )
         return f"{self.base_url}/{path.lstrip('/')}"
 
@@ -142,7 +145,8 @@ class MCPClient:
         if not self.is_enabled():
             raise MCPGatewayError(
                 f"MCP gateway is not configured; set {LLM_API_URL_ENV} and "
-                f"{LLM_API_KEY_FILE_ENV} (or {LLM_API_KEY_ENV})"
+                f"{LLM_API_KEY_FILE_ENV} (or {LLM_API_KEY_ENV})",
+                exit_code=2,
             )
         try:
             response = http_requests.request(
@@ -183,7 +187,9 @@ class MCPClient:
     def available_names(self, server: str | None = None) -> list[str]:
         """Sorted tool names available to this key."""
         return sorted(
-            t["name"] for t in self.list_tools(server) if isinstance(t, dict) and t.get("name")
+            t["name"]
+            for t in self.list_tools(server)
+            if isinstance(t, dict) and t.get("name")
         )
 
     def resolve_server(self, tool_name: str, server: str | None = None) -> str:
@@ -201,20 +207,24 @@ class MCPClient:
             scope = f" on server '{server}'" if server else ""
             raise MCPGatewayError(
                 f"Tool '{tool_name}' not found{scope}. "
-                "Run `libCRS mcp list` to see available tools."
+                "Run `libCRS mcp list` to see available tools.",
+                exit_code=2,
             )
         if len(candidates) > 1 and server is None:
             owners = sorted(
                 {
-                    ((c.get("mcp_info") or {}).get("alias")
-                     or (c.get("mcp_info") or {}).get("server_id")
-                     or "?")
+                    (
+                        (c.get("mcp_info") or {}).get("alias")
+                        or (c.get("mcp_info") or {}).get("server_id")
+                        or "?"
+                    )
                     for c in candidates
                 }
             )
             raise MCPGatewayError(
                 f"Tool '{tool_name}' is provided by multiple servers "
-                f"({', '.join(owners)}); pass --server to disambiguate."
+                f"({', '.join(owners)}); pass --server to disambiguate.",
+                exit_code=2,
             )
         info = candidates[0].get("mcp_info") or {}
         return info.get("alias") or info.get("server_id") or server or ""
@@ -243,19 +253,17 @@ class MCPClient:
         server_id = server or self.resolve_server(name)
         if not server_id:
             raise MCPGatewayError(
-                f"Could not resolve a server for tool '{name}'."
+                f"Could not resolve a server for tool '{name}'.",
+                exit_code=2,
             )
         return self._request(
             "POST",
             TOOLS_CALL_PATH,
             timeout=CALL_TIMEOUT if timeout is None else timeout,
-            json={"server_id": server_id, "name": name,
-                  "arguments": arguments or {}},
+            json={"server_id": server_id, "name": name, "arguments": arguments or {}},
         )
 
-    def describe(
-        self, name: str, server: str | None = None
-    ) -> dict[str, Any]:
+    def describe(self, name: str, server: str | None = None) -> dict[str, Any]:
         """Return the schema entry for one tool (for ``libCRS mcp describe``)."""
         for tool in self.list_tools(server):
             if isinstance(tool, dict) and tool.get("name") == name:
@@ -263,5 +271,6 @@ class MCPClient:
         scope = f" on server '{server}'" if server else ""
         raise MCPGatewayError(
             f"Tool '{name}' not found{scope}. "
-            "Run `libCRS mcp list` to see available tools."
+            "Run `libCRS mcp list` to see available tools.",
+            exit_code=2,
         )
