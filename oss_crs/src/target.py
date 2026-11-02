@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from rich.console import Console
 
 from .config.target import FuzzingEngine, TargetConfig, TargetSanitizer
-from .docker_bin import docker_cmd
+from .docker_bin import docker_cmd, single_uid_build_flags
 from .constants import (
     BASE_RUNNER_IMAGE,
     DEFAULT_BASE_RUNNER_TAG,
@@ -560,6 +560,7 @@ class Target:
                 image_tag,
                 "-f",
                 str(tmp_dockerfile),
+                *single_uid_build_flags(),
                 str(self.proj_path),
             )
             if getattr(self, "architecture", self.DEFAULT_ARCHITECTURE) == "aarch64":
@@ -603,6 +604,7 @@ class Target:
                 image_tag,
                 "-f",
                 str(tmp_dockerfile),
+                *single_uid_build_flags(),
                 str(self.proj_path),
             )
             if getattr(self, "architecture", self.DEFAULT_ARCHITECTURE) == "aarch64":

@@ -9,7 +9,7 @@ import subprocess
 from .config.crs import CRSConfig
 from .config.crs_compose import CRSEntry, CRSComposeEnv
 from .bake_hcl import parse_bake_hcl
-from .docker_bin import bake_supported, docker_cmd
+from .docker_bin import bake_supported, docker_cmd, single_uid_build_flags
 from .env_policy import build_prepare_env
 from .ui import MultiTaskProgress, TaskResult
 from .target import Target, file_lock
@@ -405,7 +405,7 @@ class CRS:
                 cmd += ["-t", tag]
             for k, v in (target_conf.get("args") or {}).items():
                 cmd += ["--build-arg", f"{k}={v}"]
-            cmd += ["--load", context]
+            cmd += ["--load", *single_uid_build_flags(), context]
             ret = multi_task_progress.run_command_with_streaming_output(
                 cmd=cmd, cwd=self.crs_path, env=env, info_text=info_text
             )
@@ -507,6 +507,7 @@ class CRS:
         )
         for key, value in args.items():
             cmd += ["--build-arg", f"{key}={value}"]
+        cmd += single_uid_build_flags()
         cmd.append(str(self.crs_path))
 
         info_text = f"Module: {module_name}\nImage: {image_tag}"

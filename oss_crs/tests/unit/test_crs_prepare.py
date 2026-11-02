@@ -727,3 +727,48 @@ def test_export_docker_host_uses_detected_rootless_socket(monkeypatch):
     )
     docker_bin.export_docker_host()
     assert os.environ["DOCKER_HOST"] == "unix:///run/user/1000/podman/podman.sock"
+
+
+def test_single_uid_files_spoof_uid_syscalls(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "single-uid"
+    runtime_dir.mkdir()
+    monkeypatch.setattr(docker_bin, "_single_uid_runtime_dir", lambda: runtime_dir)
+    seccomp_path, apt_conf, nix_conf = docker_bin.ensure_single_uid_files()
+    assert 'APT::Sandbox::User "root";' in apt_conf.read_text()
+    assert "sandbox = false" in nix_conf.read_text()
+    profile = json.loads(seccomp_path.read_text())
+    errno_zero_rules = [
+        r
+        for r in profile.get("syscalls", [])
+        if r.get("action") == "SCMP_ACT_ERRNO" and r.get("errnoRet") == 0
+    ]
+    assert errno_zero_rules
+    assert "setuid" in errno_zero_rules[0]["names"]
+    assert "chown" in errno_zero_rules[0]["names"]
+    for rule in profile["syscalls"]:
+        if rule.get("action") == "SCMP_ACT_ALLOW":
+            assert not set(rule.get("names", [])) & docker_bin.FAKE_OK_SYSCALLS
+
+
+@pytest.mark.real_single_uid_probe
+@pytest.mark.parametrize(
+    ("rootless", "subuids", "expected"),
+    [(True, False, True), (True, True, False), (False, False, False)],
+)
+def test_single_uid_mode_enabled_detects_rootless_without_subuids(
+    monkeypatch, rootless, subuids, expected
+):
+    monkeypatch.setattr(docker_bin, "is_rootless_runtime", lambda: rootless)
+    monkeypatch.setattr(docker_bin, "have_subuid_range", lambda: subuids)
+    assert docker_bin.single_uid_mode_enabled() is expected
+
+
+def test_single_uid_build_flags(monkeypatch, tmp_path):
+    runtime_dir = tmp_path / "single-uid"
+    runtime_dir.mkdir()
+    monkeypatch.setattr(docker_bin, "_single_uid_runtime_dir", lambda: runtime_dir)
+    assert docker_bin.single_uid_build_flags() == []
+    monkeypatch.setattr(docker_bin, "single_uid_mode_enabled", lambda: True)
+    flags = docker_bin.single_uid_build_flags(include_nix=True)
+    assert flags[:2] == ["--security-opt", f"seccomp={runtime_dir / 'seccomp.json'}"]
+    assert f"{runtime_dir / 'nix.conf'}:/etc/nix/nix.conf:ro" in flags

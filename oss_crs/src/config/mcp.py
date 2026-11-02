@@ -14,7 +14,7 @@ from typing import Optional
 import yaml
 from pydantic import BaseModel, field_validator
 
-from ..docker_bin import docker_cmd
+from ..docker_bin import docker_cmd, single_uid_build_flags
 
 
 def _is_dockerfile_path(image: str) -> bool:
@@ -312,7 +312,7 @@ def ensure_mcp_server_image(
         else mcp_source_dir_for_image(server.image, infra_root)
     )
     if source_dir is not None:
-        command = docker_cmd("build")
+        command = docker_cmd("build", *single_uid_build_flags())
         if dockerfile is not None:
             command.extend(["-f", str(dockerfile)])
         command.extend(["-t", server.resolved_image, str(source_dir)])

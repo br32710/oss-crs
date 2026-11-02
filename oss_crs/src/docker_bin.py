@@ -3,19 +3,68 @@
 
 Rootless hosts may not have `docker` on PATH (or `docker` may be `podman`),
 and Podman lacks `docker buildx bake`. This module picks the container CLI,
-points `podman compose` at Docker Compose v2, detects the container daemon and
-subordinate ID ranges.
+points `podman compose` at Docker Compose v2, and detects the container daemon
+and subordinate ID ranges.
+
+Without a subordinate ID range a rootless runtime has a single-UID user
+namespace, where the kernel rejects `chown`/`lchown` and
+`setuid`/`setgid`/`setgroups` to any non-zero ID with `EINVAL`/`EPERM`. That
+breaks `apt-get`, `tar`, `useradd`, and `nix build` inside `docker build`. In
+that mode this module generates:
+1. A seccomp profile that returns `SCMP_ACT_ERRNO(0)` (no-op success) for the
+   25 UID/GID-changing syscalls so ownership/user switches succeed as UID 0;
+2. An apt config snippet (`APT::Sandbox::User "root";`) so `apt` does not fail
+   its post-`setresgid` group-membership verification;
+3. A nix config snippet (`build-users-group =` / `sandbox = false`) so
+   `nix build` does not attempt to `kill(-1, SIGKILL)` as `nixbld1` while still
+   running as UID 0.
 """
 
 from __future__ import annotations
 
 import functools
 import getpass
+import json
 import os
 import pwd
 import shutil
 import subprocess
 from pathlib import Path
+
+FAKE_OK_SYSCALLS: frozenset[str] = frozenset(
+    {
+        "chown",
+        "chown32",
+        "fchown",
+        "fchown32",
+        "fchownat",
+        "lchown",
+        "lchown32",
+        "setuid",
+        "setuid32",
+        "setgid",
+        "setgid32",
+        "setreuid",
+        "setreuid32",
+        "setregid",
+        "setregid32",
+        "setresuid",
+        "setresuid32",
+        "setresgid",
+        "setresgid32",
+        "setfsuid",
+        "setfsuid32",
+        "setfsgid",
+        "setfsgid32",
+        "setgroups",
+        "setgroups32",
+    }
+)
+
+_SYSTEM_SECCOMP_CANDIDATES = (
+    Path("/usr/share/containers/seccomp.json"),
+    Path("/etc/containers/seccomp.json"),
+)
 
 
 def docker_bin() -> str:
@@ -234,3 +283,95 @@ def export_docker_host() -> None:
     kind, detail = describe_daemon()
     if kind in ("podman", "rootless-docker") and detail.startswith("unix://"):
         os.environ["DOCKER_HOST"] = detail
+
+
+# Cached: this probes the daemon and subordinate ID ranges and is checked before
+# every build and run, and neither can change while oss-crs is running.
+@functools.cache
+def single_uid_mode_enabled() -> bool:
+    """Whether builds and runs need the single-UID seccomp profile.
+
+    True for a rootless runtime when the user has no subordinate ID range.
+    """
+    return is_rootless_runtime() and not have_subuid_range()
+
+
+def _build_single_uid_seccomp_profile() -> dict:
+    """Build an OCI seccomp profile that spoofs UID/GID syscalls with errno=0."""
+    base: dict | None = None
+    for cand in _SYSTEM_SECCOMP_CANDIDATES:
+        if cand.is_file():
+            try:
+                base = json.loads(cand.read_text())
+                break
+            except Exception:
+                continue
+    if base is None:
+        return {
+            "defaultAction": "SCMP_ACT_ALLOW",
+            "syscalls": [
+                {
+                    "names": sorted(FAKE_OK_SYSCALLS),
+                    "action": "SCMP_ACT_ERRNO",
+                    "args": [],
+                    "errnoRet": 0,
+                }
+            ],
+        }
+    new_syscalls = []
+    for entry in base.get("syscalls", []):
+        if entry.get("action") == "SCMP_ACT_ALLOW":
+            names = [n for n in entry.get("names", []) if n not in FAKE_OK_SYSCALLS]
+            if names:
+                new_syscalls.append({**entry, "names": names})
+        else:
+            new_syscalls.append(entry)
+    new_syscalls.append(
+        {
+            "names": sorted(FAKE_OK_SYSCALLS),
+            "action": "SCMP_ACT_ERRNO",
+            "args": [],
+            "comment": "Spoof UID/GID changes as no-op success in single-UID userns",
+            "includes": {},
+            "excludes": {},
+            "errnoRet": 0,
+        }
+    )
+    return {**base, "syscalls": new_syscalls}
+
+
+def _single_uid_runtime_dir() -> Path:
+    base = Path(__file__).resolve().parents[2] / ".oss-crs-workdir" / "single-uid"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def ensure_single_uid_files() -> tuple[Path, Path, Path]:
+    """Materialize (seccomp.json, apt.conf, nix.conf) for single-UID builds."""
+    d = _single_uid_runtime_dir()
+    seccomp_path = d / "seccomp.json"
+    apt_conf = d / "apt-single-uid.conf"
+    nix_conf = d / "nix.conf"
+    if not seccomp_path.is_file():
+        seccomp_path.write_text(json.dumps(_build_single_uid_seccomp_profile()))
+    if not apt_conf.is_file():
+        apt_conf.write_text('APT::Sandbox::User "root";\n')
+    if not nix_conf.is_file():
+        nix_conf.write_text("build-users-group =\nsandbox = false\n")
+    return seccomp_path, apt_conf, nix_conf
+
+
+def single_uid_build_flags(*, include_nix: bool = False) -> list[str]:
+    """Extra `docker build` / `docker run` flags for single-UID rootless mode."""
+    if not single_uid_mode_enabled():
+        return []
+    seccomp_path, apt_conf, nix_conf = ensure_single_uid_files()
+    flags = [
+        "--security-opt",
+        f"seccomp={seccomp_path}",
+        "-v",
+        f"{apt_conf}:/etc/apt/apt.conf.d/99-oss-crs-single-uid.conf:ro",
+    ]
+    if include_nix:
+        flags += ["-v", f"{nix_conf}:/etc/nix/nix.conf:ro"]
+    return flags

@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path
 
 from .constants import NIX_BUILDER_IMAGE, OSS_CRS_DEPS_IMAGE
-from .docker_bin import docker_bin, docker_cmd
+from .docker_bin import docker_bin, docker_cmd, single_uid_build_flags
 
 # Dockerfile (relative to the libCRS directory) that builds the deps image.
 DEPS_DOCKERFILE_NAME = "deps.Dockerfile"
@@ -93,6 +93,7 @@ def build_deps_image(libcrs_dir: Path) -> tuple[bool, str]:
         str(dockerfile),
         "--build-arg",
         f"NIX_BUILDER_IMAGE={NIX_BUILDER_IMAGE}",
+        *single_uid_build_flags(include_nix=True),
         str(libcrs_dir.resolve()),
     )
 

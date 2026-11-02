@@ -20,6 +20,11 @@ def pytest_configure(config):
         "markers",
         "real_cli_probe: run the real `_cli_is_podman` instead of assuming Docker",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_single_uid_probe: run the real `single_uid_mode_enabled` instead of "
+        "assuming multi-UID mode",
+    )
 
 
 @pytest.fixture

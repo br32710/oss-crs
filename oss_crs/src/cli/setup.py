@@ -358,12 +358,8 @@ class SetupRunner:
         else:
             self.print_status(
                 "Subordinate ids",
-                False,
-                "no /etc/subuid + /etc/subgid range — rootless Podman/Docker need one for multi-UID images",
-            )
-            self.console.print(
-                "  [dim]Ask an admin to run: sudo usermod --add-subuids 100000-165535 "
-                "--add-subgids 100000-165535 <user>[/dim]"
+                True,
+                "none — single-UID mode (see docs/setup.md)",
             )
 
     def run(self, check_only: bool = False) -> bool:

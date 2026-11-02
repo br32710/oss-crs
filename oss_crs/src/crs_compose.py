@@ -22,7 +22,7 @@ from .env_policy import (
 from .llm import LLM
 from .crs import CRS
 from .config.crs import CRSType
-from .docker_bin import docker_cmd
+from .docker_bin import docker_cmd, single_uid_build_flags
 from .ui import MultiTaskProgress, TaskResult, EarlyExitConfig
 from .target import Target, file_lock
 from .templates import renderer
@@ -929,7 +929,7 @@ class CRSCompose:
         for subdir, tag in images.items():
             context = infra_root / subdir
             result = subprocess.run(
-                docker_cmd("build", "-t", tag, str(context)),
+                docker_cmd("build", "-t", tag, *single_uid_build_flags(), str(context)),
                 capture_output=True,
                 text=True,
             )

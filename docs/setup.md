@@ -101,9 +101,9 @@ No additional configuration is needed after running `oss-crs setup`.
 `prepare`, `build-target`, `run` and `list-harnesses` work under
 [rootless Docker](https://docs.docker.com/engine/security/rootless/) or
 [rootless Podman](https://github.com/containers/podman/blob/main/docs/tutorials/rootless_tutorial.md).
-Follow the upstream guide for your runtime, including the subordinate ID range
-(`/etc/subuid` / `/etc/subgid`) it requires; images with several users
-(`_apt`, `postgres`, `nixbld*`) fail without one.
+Follow the upstream guide for your runtime. A subordinate ID range
+(`/etc/subuid` / `/etc/subgid`) is optional; see
+[Single-UID mode](#single-uid-mode).
 
 Compose and the builder and lifecycle sidecars need a Docker-compatible API
 socket. With Podman, enable `podman.socket`. `oss-crs` uses `DOCKER_HOST` if
@@ -115,6 +115,29 @@ ID range is configured and, on Podman, which Compose v2 is used.
 `oss-crs setup` (cgroup-parent mode) needs sudo and rootful Docker, so you can
 skip it for rootless runtimes; runs then use per-container limits (see
 [Auto-Detection](#auto-detection)).
+
+### Single-UID mode
+
+Without a subordinate ID range, only container UID `0` (mapped to your host
+UID) exists in the user namespace, so changing file ownership or switching
+users fails inside images with several users (`_apt`, `postgres`, `nixbld*`).
+`oss-crs` detects this automatically on rootless runtimes and writes
+`.oss-crs-workdir/single-uid/`:
+
+- `seccomp.json`: returns success without doing anything for the 25
+  UID/GID-changing syscalls (`chown`, `setuid`, `setresgid`, `setgroups`, …),
+  so `apt-get`, `tar` and `useradd` succeed as UID `0`.
+- `apt-single-uid.conf`: sets `APT::Sandbox::User "root";`.
+- `nix.conf`: sets `build-users-group =` and `sandbox = false` for Nix builds.
+
+Builds and `build-target` runs use that profile and those files. Compose cannot
+pass them, so `oss-crs` builds compose images with `docker build` and runs the
+target builder with `docker run`. When `oss-crs-postgres` is started
+(`llm_config.litellm.mode: internal`), PostgreSQL runs in a nested user
+namespace (`unshare --user --map-user=999 --map-group=999`).
+
+With a subordinate ID range (`sudo usermod --add-subuids 100000-165535
+--add-subgids 100000-165535 <user>`), none of this is used.
 
 ### Podman
 

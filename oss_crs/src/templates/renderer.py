@@ -24,7 +24,7 @@ from ..constants import (
     POSTGRES_PORT,
     POSTGRES_USER,
 )
-from ..docker_bin import describe_daemon
+from ..docker_bin import describe_daemon, single_uid_mode_enabled
 from ..env_policy import build_run_service_env, build_target_builder_env
 from ..llm import DEFAULT_LITELLM_CONFIG_PATH
 from ..utils import (
@@ -563,6 +563,7 @@ def render_run_crs_compose_docker_compose(
         "postgres_user": POSTGRES_USER,
         "postgres_port": POSTGRES_PORT,
         "postgres_host": POSTGRES_HOST,
+        "single_uid_mode": single_uid_mode_enabled(),
         "rebuild_out_dir": rebuild_out_dir,
         "incremental_build": incremental_build,
         "privileged": privileged,

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 import json
+import os
+import shutil
 import subprocess
 import time
 import threading
@@ -13,7 +15,12 @@ import yaml
 from rich.console import Console, Group
 
 from .constants import PRESERVED_BUILDER_REPO, PRESERVED_RUNNER_REPO
-from .docker_bin import docker_cmd, is_podman_cli
+from .docker_bin import (
+    docker_cmd,
+    is_podman_cli,
+    single_uid_build_flags,
+    single_uid_mode_enabled,
+)
 from .utils import bold, get_console, green, log_error, yellow  # noqa: F401 (re-exported)
 from rich.live import Live
 from rich.markup import escape
@@ -834,7 +841,7 @@ class MultiTaskProgress:
         project_name: str,
         docker_compose_path: Path,
     ) -> TaskResult:
-        if is_podman_cli():
+        if is_podman_cli() or single_uid_mode_enabled():
             ret = self._build_compose_images_directly(project_name, docker_compose_path)
             if ret.success:
                 return ret
@@ -888,7 +895,8 @@ class MultiTaskProgress:
                     success=False,
                     error=(
                         f"Service {service_name}: build keys "
-                        f"{sorted(unsupported)} are not supported with Podman."
+                        f"{sorted(unsupported)} are not supported with Podman "
+                        "or in single-UID mode."
                     ),
                 )
             context = compose_dir / build.get("context", ".")
@@ -909,6 +917,7 @@ class MultiTaskProgress:
                 cmd += ["--build-arg", arg]
             for extra in _compose_mapping(build.get("additional_contexts")):
                 cmd += ["--build-context", extra]
+            cmd += single_uid_build_flags()
             cmd.append(str(context))
             ret = self.run_command_with_streaming_output(
                 cmd=cmd,
@@ -921,6 +930,10 @@ class MultiTaskProgress:
     def docker_compose_run(
         self, project_name: str, docker_compose_path: Path, service_name: str
     ) -> TaskResult:
+        if single_uid_mode_enabled():
+            return self._run_compose_service_directly(
+                project_name, docker_compose_path, service_name
+            )
         cmd = docker_cmd(
             "compose",
             "-p",
@@ -934,6 +947,60 @@ class MultiTaskProgress:
         return self.run_command_with_streaming_output(
             cmd=cmd,
             info_text=f"Running service {service_name} with docker-compose",
+        )
+
+    def _run_compose_service_directly(
+        self, project_name: str, docker_compose_path: Path, service_name: str
+    ) -> TaskResult:
+        """Run a compose service with `docker run` and the single-UID flags.
+
+        Compose cannot pass the single-UID seccomp profile and apt/nix mounts to
+        `run`, so the service is translated directly; keys outside
+        `_DIRECT_RUN_KEYS` are rejected rather than silently dropped.
+        """
+        compose_data = yaml.safe_load(docker_compose_path.read_text()) or {}
+        service = (compose_data.get("services") or {}).get(service_name)
+        if not isinstance(service, dict):
+            return TaskResult(
+                success=False,
+                error=f"Service {service_name} not found in {docker_compose_path}",
+            )
+        unsupported = set(service) - _DIRECT_RUN_KEYS
+        if unsupported:
+            return TaskResult(
+                success=False,
+                error=(
+                    f"Service {service_name}: keys {sorted(unsupported)} are not "
+                    "supported in single-UID mode."
+                ),
+            )
+        image = service.get("image") or f"{project_name}-{service_name}"
+        cmd = docker_cmd("run", "--rm")
+        if service.get("privileged"):
+            cmd.append("--privileged")
+        if service.get("shm_size"):
+            cmd.append(f"--shm-size={service['shm_size']}")
+        cpuset = service.get("cpuset")
+        if cpuset:
+            uid = os.getuid()
+            controllers = Path(
+                f"/sys/fs/cgroup/user.slice/user-{uid}.slice/"
+                f"user@{uid}.service/cgroup.controllers"
+            )
+            if controllers.is_file() and "cpuset" in controllers.read_text().split():
+                cmd += ["--cpuset-cpus", str(cpuset)]
+            elif shutil.which("taskset"):
+                cmd = ["taskset", "-c", str(cpuset), *cmd]
+        if service.get("mem_limit"):
+            cmd += ["--memory", str(service["mem_limit"])]
+        for item in _compose_mapping(service.get("environment")):
+            cmd += ["-e", item]
+        for volume in service.get("volumes") or []:
+            cmd += ["-v", str(volume)]
+        cmd += [*single_uid_build_flags(), image]
+        return self.run_command_with_streaming_output(
+            cmd=cmd,
+            info_text=f"Running service {service_name}",
         )
 
     def docker_compose_up(
@@ -1406,6 +1473,16 @@ class MultiTaskProgress:
 
 
 _DIRECT_BUILD_KEYS = {"context", "dockerfile", "args", "additional_contexts", "target"}
+_DIRECT_RUN_KEYS = {
+    "build",
+    "image",
+    "privileged",
+    "shm_size",
+    "cpuset",
+    "mem_limit",
+    "environment",
+    "volumes",
+}
 
 
 def _compose_mapping(value: object) -> list[str]:

@@ -800,3 +800,83 @@ def test_docker_compose_build_on_podman_rejects_unsupported_keys(
     result = progress.docker_compose_build("proj", compose_path)
     assert not result.success
     assert "secrets" in (result.error or "")
+
+
+def _single_uid_progress(monkeypatch, cmds: list[list[str]]) -> MultiTaskProgress:
+    import oss_crs.src.ui as ui
+
+    monkeypatch.setattr(ui, "single_uid_mode_enabled", lambda: True)
+    monkeypatch.setattr(ui, "single_uid_build_flags", lambda: ["--su"])
+    progress = MultiTaskProgress(tasks=[], title="test")
+    monkeypatch.setattr(
+        progress,
+        "run_command_with_streaming_output",
+        lambda cmd, **_kw: cmds.append(cmd) or TaskResult(success=True),
+    )
+    return progress
+
+
+def test_docker_compose_build_in_single_uid_mode_builds_with_flags(
+    monkeypatch, tmp_path: Path
+) -> None:
+    compose_path = tmp_path / "docker-compose.yaml"
+    compose_path.write_text("services:\n  s:\n    build:\n      context: /c\n")
+    cmds: list[list[str]] = []
+    progress = _single_uid_progress(monkeypatch, cmds)
+
+    assert progress.docker_compose_build("proj", compose_path).success
+    assert cmds == [
+        [
+            "docker", "build", "-f", "/c/Dockerfile", "-t", "proj-s",
+            "--label", "com.docker.compose.project=proj", "--su", "/c",
+        ]
+    ]  # fmt: skip
+
+
+def test_docker_compose_run_in_single_uid_mode_uses_docker_run(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import oss_crs.src.ui as ui
+
+    compose_path = tmp_path / "docker-compose.yaml"
+    compose_path.write_text(
+        """\
+services:
+  target_builder:
+    privileged: true
+    shm_size: 2g
+    environment:
+      - A=1
+    build:
+      context: /c
+    mem_limit: "4G"
+    volumes:
+      - /out:/OUT
+"""
+    )
+    monkeypatch.setattr(ui.shutil, "which", lambda _name: None)
+    cmds: list[list[str]] = []
+    progress = _single_uid_progress(monkeypatch, cmds)
+
+    assert progress.docker_compose_run("proj", compose_path, "target_builder").success
+    assert cmds == [
+        [
+            "docker", "run", "--rm", "--privileged", "--shm-size=2g",
+            "--memory", "4G", "-e", "A=1", "-v", "/out:/OUT",
+            "--su", "proj-target_builder",
+        ]
+    ]  # fmt: skip
+
+
+def test_docker_compose_run_in_single_uid_mode_rejects_unsupported_keys(
+    monkeypatch, tmp_path: Path
+) -> None:
+    compose_path = tmp_path / "docker-compose.yaml"
+    compose_path.write_text("services:\n  s:\n    image: x\n    networks: [n]\n")
+    cmds: list[list[str]] = []
+    progress = _single_uid_progress(monkeypatch, cmds)
+
+    result = progress.docker_compose_run("proj", compose_path, "s")
+    assert not result.success
+    assert "networks" in (result.error or "")
+    assert cmds == []
